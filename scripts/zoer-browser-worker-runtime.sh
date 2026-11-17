@@ -32,8 +32,21 @@ if ! ssh "${worker_args[@]}" "ubuntu@$ip" 'sudo k3s ctr images ls -q' | grep -Fx
   size="$(ssh "${ssh_args[@]}" "$server" "sudo docker image inspect '$image' --format '{{.Size}}'")"
   [[ "$size" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ && "$capacity" =~ ^[0-9]+$ ]] || exit 1
   (( available > capacity / 10 + 2 * size / 1024 + 1048576 )) || { echo 'Insufficient browser-node disk reserve; preserve profiles and referenced images.'; exit 1; }
-  ssh "${ssh_args[@]}" "$server" "sudo docker save '$image' | gzip -1" |
-    ssh "${worker_args[@]}" "ubuntu@$ip" 'gzip -d | sudo k3s ctr images import --no-unpack -'
+  # Copy inside the homelab: the build node streams straight to the browser node, so the
+  # multi-GB image never crosses the operator's machine or VPN. The build node's key is
+  # authorized on the browser node with from="<build node>",restrict; the transfer still
+  # checks the browser node's host key that was verified through the guest agent above.
+  server_key="${ZOER_BROWSER_WORKER_KEY_ON_SERVER:-/home/ubuntu/.ssh/zoer-browser-worker}"
+  if ssh "${ssh_args[@]}" "$server" "test -r '$server_key'"; then
+    known="$(cat "$work/known_hosts")"
+    ssh "${ssh_args[@]}" "$server" "set -o pipefail; kh=\$(mktemp); trap 'rm -f \$kh' EXIT; printf '%s\n' '$known' > \$kh
+      sudo docker save '$image' | gzip -1 | ssh -i '$server_key' -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\$kh 'ubuntu@$ip' 'gzip -d | sudo k3s ctr images import --no-unpack -'"
+  else
+    echo "Build node has no key for the browser node ($server_key); streaming through this machine instead."
+    ssh "${ssh_args[@]}" "$server" "sudo docker save '$image' | gzip -1" |
+      ssh "${worker_args[@]}" "ubuntu@$ip" 'gzip -d | sudo k3s ctr images import --no-unpack -'
+  fi
 fi
 ssh "${worker_args[@]}" "ubuntu@$ip" "sudo k3s ctr images label '$image' io.cri-containerd.pinned=pinned >/dev/null"
 echo "Browser node $node has pinned runtime $image"
